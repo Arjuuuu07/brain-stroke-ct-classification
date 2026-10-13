@@ -1,0 +1,3 @@
+paths:
+  data_root: 'D:\brain stroke\Brain file_org\Brain_Stroke_CT_Dataset'
+  output_dir: 'D:\brain stroke\Brain file_org\Brain_Stroke_CT_Dataset\Features'

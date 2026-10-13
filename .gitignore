@@ -1,0 +1,9 @@
+outputs/
+configs/local.yaml
+data/
+*.pt
+*.npz
+*.dcm
+__pycache__/
+*.egg-info/
+.ipynb_checkpoints/

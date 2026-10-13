@@ -1,0 +1,112 @@
+seed: 42
+
+paths:
+  data_root: "data/Brain_Stroke_CT_Dataset"     # relative paths below are resolved against this
+  output_dir: "outputs"
+  folders:
+    Bleeding: "Bleeding/DICOM"
+    Ischemia: "Ischemia/DICOM"
+    Normal: "Normal/DICOM"
+  external_test_dicom_dir: "External_Test/DICOM"
+  external_test_labels_csv: "External_Test/labels Copy.csv"
+  overlay_dir: "Bleeding/OVERLAY"
+
+data:
+  class_labels: {Bleeding: 1, Ischemia: 0, Normal: 0}
+  valid_exts: [".dcm", ".dicom", ""]
+  img_size: 256
+  imagenet_mean: [0.485, 0.456, 0.406]
+  imagenet_std: [0.229, 0.224, 0.225]
+
+cache:
+  full_dir: "preprocess_cache_v23"
+  image_only_dir: "image_only_cache_v4"
+
+preprocessing:
+  # skull strip
+  bone_hu_threshold: 90
+  pocket_hu_low: 0
+  pocket_hu_high: 100
+  min_pocket_area: 60
+  # border erosion
+  border_erode_mm: 1
+  border_smooth_sigma: 2.0
+  # bbox + adaptive binarization
+  tissue_hu_threshold: 5
+  hu_low_start: 45
+  hu_high_fixed: 80
+  hu_step: 8
+  white_pct_target: 6.0
+  min_white_pct_floor: 4.0
+  fine_step: 1
+  hu_low_cap: 60
+  hu_low_min: 36
+  salt_pepper_kernel_size: 3
+  pre_bbox_salt_pepper_kernel_size: 2
+  # extended neighbourhood
+  extend_pixels: 10
+  hu_extend_margin: 90.0
+  neighbour_hu_low: 0
+  neighbour_hu_high: 100
+  # red overlay detection (HSV)
+  red_hsv_lower_1: [0, 40, 40]
+  red_hsv_upper_1: [10, 255, 255]
+  red_hsv_lower_2: [170, 40, 40]
+  red_hsv_upper_2: [180, 255, 255]
+  # grey-region cleanup
+  grey_region_hu_cutoff: 100
+
+training:
+  n_per_class_pool: 500
+  batch_size: 8
+  epochs: 25
+  patience: 7
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  folds: 5
+  num_workers: 0
+  recall_weight: 0.4
+  precision_weight: 0.6
+  decision_threshold: 0.5
+  augment: false
+  device: null            # null = auto (cuda if available)
+
+segmentation:
+  batch_size: 8
+  epochs: 70
+  patience: 8
+  val_fraction: 0.15
+  threshold: 0.5
+  bce_weight: 0.3
+  dice_weight: 1.0
+  use_tversky: false
+  tversky_alpha: 0.3      # FP weight
+  tversky_beta: 0.7       # FN weight
+  lr_encoder: 1.0e-5
+  lr_decoder: 3.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 5.0
+  freeze_encoder: false
+  keep_bn_eval: true
+  num_workers: 0
+  augment: true
+  encoder_checkpoint: null   # null = best fold resolved from cv summary csv
+  device: null
+
+threshold_tune:
+  threshold: 0.96
+  sweep_start: 0.05
+  sweep_end: 0.96
+  sweep_step: 0.05
+  probs_path: null
+  plot: true
+
+outputs:
+  fold_model_pattern: "cls_resnet_try2_best_{fold}.pt"
+  cv_summary_csv: "cls_cv_summary_3ch.csv"
+  final_test_csv: "cls_final_test_summary_3ch.csv"
+  test_probs_npz: "cls_test_probs_labels_3ch.npz"
+  sweep_csv: "cls_threshold_sweep_3ch.csv"
+  sweep_plot: "cls_threshold_sweep_plot_3ch.png"
+  seg_dir: "segmentation_results"
+  seg_model: "seg_model_best.pt"
