@@ -1,6 +1,6 @@
 # Brain Stroke CT Classification
 
-Deep-learning pipeline for detecting **intracranial hemorrhage (bleeding)** on non-contrast head CT scans stored as DICOM. The repository contains a preprocessing pipeline based on Hounsfield units (HU), a ResNet18 classifier trained with 5-fold cross-validation, a decision-threshold analysis tool, and a U-Net-style segmentation model that reuses the classifier's encoder.
+Deep-learning pipeline for detecting **intracranial hemorrhage (bleeding)** on non-contrast head CT scans stored as DICOM. The repository contains a preprocessing pipeline based on Hounsfield units (HU), a ResNet18 classifier trained with 5-fold cross-validation, a decision-threshold analysis tool, and a U-Net-style segmentation model that reuses the classifier's encoder. It also includes an implemented but not yet evaluated hemorrhage-candidate "guide mask" path (adaptive HU binarization with a neighbourhood extension) for later comparison against the image-only baseline.
 
 > **Research code, not a medical device.** Nothing here has been clinically validated and it must not be used for diagnosis or treatment decisions.
 
@@ -54,20 +54,31 @@ Ischemia and Normal are merged into one negative class because the goal is speci
 ## 2. Overview of the approach
 
 ```mermaid
-flowchart LR
+flowchart TD
     A[DICOM slice] --> B[Convert to HU]
-    B --> C[Skull strip + border cleanup]
-    C --> D[Window 0-100 HU, resize 256x256]
-    D --> E[ResNet18 classifier<br/>5-fold CV]
-    E --> F[Held-out test evaluation]
-    F --> G[Threshold sweep]
-    E --> H[Segmentation fine-tuning<br/>U-Net decoder]
+    B --> C[Skull strip]
+    C --> D[Smoothed border erosion<br/>+ residual / salt-and-pepper cleanup]
+
+    D --> E[Window 0-100 HU<br/>resize 256x256]
+    E --> F[ResNet18 classifier<br/>5-fold CV]
+    F --> G[Held-out test evaluation]
+    G --> H[Threshold sweep]
+    F --> I[Segmentation fine-tuning<br/>U-Net decoder]
+
+    D -.-> J[Tissue bounding box]
+    J -.-> K[Adaptive HU binarization<br/>fixed high edge, adaptive low edge]
+    K -.-> L[Guide mask<br/>tissue mask + salt-and-pepper cleanup]
+    L -.-> M[Extend by 10 px<br/>HU-similarity constraint]
+    M -.-> N[Extended guide mask]
+    N -.-> O[Guide-mask experiments<br/>not used by the baseline]
 ```
+
+Solid arrows are what the baseline classifier uses. Dashed arrows are implemented in `preprocess_scan` but are not used by the image-only baseline.
 
 Steps:
 
 1. **Discover files** and assign labels from folder names (`manifest.py`).
-2. **Preprocess** each DICOM into a clean, normalized 256x256 image and cache it (`preprocessing.py`).
+2. **Preprocess** each DICOM into a clean, normalized 256x256 image (used by the baseline) and, optionally, a hemorrhage-candidate guide mask (section 4.7), and cache them (`preprocessing.py`).
 3. **Train** a ResNet18 classifier with stratified 5-fold cross-validation on a balanced pool of 1,000 scans (`train.py`).
 4. **Select** the best fold using validation metrics only, then evaluate it once on the held-out remaining scans.
 5. **Analyze thresholds** on the saved test probabilities (`threshold_tune.py`).
@@ -125,8 +136,28 @@ The stored pixel values are converted to HU with the scan's `RescaleSlope` and `
 ### 4.6 Caching
 Preprocessing is slow compared with training, so the clean image is cached as a compressed `.npz`, both on disk and in memory. A fingerprint of the cache-relevant parameters is stored in `_cache_params.json`. If you change one of those parameters, the cache is cleared and rebuilt automatically at the next start.
 
-### 4.7 What the classifier actually uses
-`train.py` uses only the **clean image** from sections 4.1-4.5 (`get_clean_image_norm`). The preprocessing module also contains a richer path, `preprocess_scan`, that computes a bounding box, adaptive HU binarization, a guide mask, an extended-neighbourhood mask and the segmentation ground truth. It is implemented but is **not** used by the image-only classifier.
+`train.py` uses the clean image from sections 4.1-4.5 (`get_clean_image_norm`). The guide-mask path below uses `preprocess_scan` and has its own cache.
+
+### 4.7 Guide-mask path (hemorrhage-candidate region)
+
+Besides the clean image, `Preprocessor.preprocess_scan` builds a **hemorrhage-candidate mask** from the cleaned HU image. The image-only baseline in section 13 does **not** use it; it is the basis for guide-mask experiments compared against that baseline. All values below are in `preprocessing:` in `configs/default.yaml`.
+
+**a) Tissue bounding box.** The smallest box containing every pixel with HU >= `tissue_hu_threshold` (5). The adaptive step below works inside this box, so empty background does not affect the statistics.
+
+**b) Adaptive HU binarization.** The mask contains every pixel in the box with HU in `[hu_low, hu_high_fixed]`.
+- The **upper edge is fixed** at `hu_high_fixed` = 80 HU.
+- The **lower edge adapts** per slice, starting at `hu_low_start` = 45, so that the white area covers between `min_white_pct_floor` (4%) and `white_pct_target` (6%) of the bounding box.
+- If the area is above the target, `hu_low` is raised in coarse steps of `hu_step` (8 HU) up to `hu_low_cap` (60), then refined in 1 HU steps (`fine_step`) if it overshoots below the floor.
+- If the area is below the floor, `hu_low` is lowered in 1 HU steps down to `hu_low_min` (36).
+- Effect: the candidate region stays at a roughly constant fraction of the brain on every slice, so one rule handles slices with different brightness.
+
+**c) Guide mask.** The binary mask is multiplied by the tissue mask, then cleaned with a morphological open + close (`salt_pepper_kernel_size` = 3) to remove isolated specks.
+
+**d) Extended neighbourhood.** The guide mask is dilated by `extend_pixels` (10 px, elliptical kernel). A dilated pixel is kept only if its HU lies in `[hu_low_used - hu_extend_margin, hu_high_fixed]`, with `hu_extend_margin` = 90. The original guide mask is always kept. With a 90 HU margin the lower bound is below 0 HU, so the intensity test mainly rejects removed pixels (-1000) and values above 80 HU. Reduce the margin for a tighter neighbourhood.
+
+**e) Extended guide mask image.** The cleaned HU image is windowed to `neighbour_hu_low`-`neighbour_hu_high` (0-100 HU), scaled to [0, 1] and multiplied by the extended mask. It keeps the real intensities of the candidate region and its surroundings, and zeros everything else.
+
+`preprocess_scan` returns, at 256x256: the clean image, the binary guide mask (nearest-neighbour resized), the extended guide mask image, the segmentation ground truth from the red overlay, and the label.
 
 ---
 
@@ -207,7 +238,7 @@ brain-stroke-ct-classification/
 │   ├── __init__.py
 │   ├── config.py             # YAML loading, local override, CLI overrides
 │   ├── manifest.py           # DICOM discovery and labels (no pixel data loaded)
-│   ├── preprocessing.py      # HU conversion, skull strip, caching
+│   ├── preprocessing.py      # HU conversion, skull strip, guide mask, caching
 │   ├── datasets.py           # classification and segmentation datasets
 │   ├── models.py             # ResNet18 encoder and segmentation decoder
 │   ├── metrics.py            # classification metrics, Dice / Tversky losses
@@ -316,11 +347,14 @@ Everything is written to `paths.output_dir`:
 | `cls_test_probs_labels_3ch.npz` | train | test probabilities and labels |
 | `cls_threshold_sweep_3ch.csv` / `.png` | threshold_tune | sweep table and plot |
 | `segmentation_results/models/seg_model_best.pt` | segmentation | best segmentation model |
-| `image_only_cache_v4/`, `preprocess_cache_v23/` | preprocessing | cached preprocessed images |
+| `image_only_cache_v4/` | preprocessing | cached clean images (baseline) |
+| `preprocess_cache_v23/` | preprocessing | cached guide-mask outputs |
 
 ---
 
 ## 13. Results
+
+These results are for the **image-only baseline** (clean image, no guide mask).
 
 Run configuration: `python scripts/train.py --epochs 15 --folds 5` (seed 42, GPU). Model: ResNet18, 11.18M parameters, 2.38 GFLOPs per 256x256 image. Total 5-fold CV time: 8.4 min.
 
@@ -386,6 +420,7 @@ Raising the threshold from 0.50 to 0.95 removes about 115 false alarms but misse
 - Fold-to-fold variation is large (accuracy 0.91 to 0.97, specificity 0.83 to 0.98) on only 200 validation scans, so single-fold differences are largely noise.
 - Recall on the test set (0.93) is a little lower than on validation (0.97), and it falls further when the threshold is raised.
 - Segmentation results are not reported yet. `<ADD Dice / IoU after running scripts/segmentation.py>`
+- Guide-mask experiments are not reported yet. `<ADD comparison against this baseline, using the same pool, folds and held-out set>`
 
 ---
 
@@ -402,6 +437,7 @@ These affect how far the reported numbers can be trusted.
 7. **Error handling.** If a scan fails to load in the dataset, a blank image with label 0 is returned instead of raising an error. Overlay matching falls back to substring matching, which can pick the wrong file.
 8. **External test set** is indexed but not yet used for evaluation.
 9. **Decoder resolution.** The decoder does not use the highest-resolution encoder features, which can blur outlines of small bleeds.
+10. **Guide mask is untested here.** The adaptive binarization targets a fixed 4-6% white area per slice, so it will also produce candidate regions on slices without any bleed. Its usefulness as a classifier input has not been measured in this repository yet.
 
 ---
 
@@ -433,7 +469,7 @@ These affect how far the reported numbers can be trusted.
 - Patient-level splits and out-of-fold threshold selection.
 - Report cross-fold mean/std and fold-ensemble test results.
 - Final evaluation on `External_Test`.
-- Extra input channels (for example a binarized hemorrhage-candidate mask) compared against this image-only baseline, using the same pool, folds and held-out set.
+- Use the guide-mask path (section 4.7) as an extra input channel and compare it against this image-only baseline, using the same pool, folds and held-out set.
 - Model explainability with Grad-CAM.
 - Higher-resolution skip connections in the decoder.
 
