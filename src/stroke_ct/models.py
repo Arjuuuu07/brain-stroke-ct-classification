@@ -4,6 +4,24 @@ import torch.nn.functional as F
 from torchvision import models as tv_models
 
 
+class ResNetClassifier(nn.Module):
+    """ResNet backbone + global average pooling + one linear logit (used by scripts/train.py)."""
+
+    def __init__(self, backbone="resnet18", pretrained=True):
+        super().__init__()
+        base = getattr(tv_models, backbone)(weights="IMAGENET1K_V1" if pretrained else None)
+        self.body = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool,
+                                  base.layer1, base.layer2, base.layer3, base.layer4)
+        self.fc = nn.Linear(base.fc.in_features, 1)
+
+    def forward(self, x):
+        return self.fc(self.body(x).mean((2, 3)))
+
+
+# ----------------------------------------------------------------------
+# Kept for the parked segmentation script (archive/segmentation_old.py).
+# Not used by the classification pipeline.
+# ----------------------------------------------------------------------
 class Image3ChResNet(nn.Module):
     """Plain ResNet18 encoder, in_channels=3. Classification head only."""
 
@@ -32,12 +50,11 @@ class Image3ChResNet(nn.Module):
         _, _, _, s4 = self._encode(x)
         pooled = self.avgpool(s4).flatten(1)
         class_logit = self.classifier(pooled)
-        return class_logit, None   # seg branch not implemented -- classification only
+        return class_logit, None
 
 
 class Image3ChSegResNet(Image3ChResNet):
-    """Same encoder as Image3ChResNet (state_dict keys identical, so fold checkpoints
-    load directly) + U-Net decoder with fresh init."""
+    """Same encoder as Image3ChResNet + U-Net decoder with fresh init."""
 
     def __init__(self):
         super().__init__()
@@ -60,11 +77,9 @@ class Image3ChSegResNet(Image3ChResNet):
 
     def forward(self, x, seg=True):
         s1, s2, s3, s4 = self._encode(x)
-
         cls_logit = self.classifier(self.avgpool(s4).flatten(1))
         if not seg:
             return cls_logit, None
-
         d = self.up4(s4); d = self.dec4(torch.cat([d, s3], 1))
         d = self.up3(d);  d = self.dec3(torch.cat([d, s2], 1))
         d = self.up2(d);  d = self.dec2(torch.cat([d, s1], 1))
@@ -74,8 +89,6 @@ class Image3ChSegResNet(Image3ChResNet):
 
 
 def set_train_mode(model, keep_encoder_bn_eval=True):
-    """model.train() but leaves encoder BN layers in eval() so the loaded running stats
-    are not overwritten by small-batch statistics during segmentation fine-tuning."""
     model.train()
     if keep_encoder_bn_eval:
         for mod in (model.stem, model.layer1, model.layer2, model.layer3, model.layer4):
