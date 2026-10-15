@@ -1,5 +1,4 @@
 """YAML config loading: default.yaml + optional local.yaml override + CLI overrides."""
-import os
 from pathlib import Path
 
 import yaml
@@ -24,7 +23,7 @@ def _resolve_paths(cfg):
         return str(x if x.is_absolute() else root / x)
 
     p["folders"] = {k: join(v) for k, v in p["folders"].items()}
-    for key in ("external_test_dicom_dir", "external_test_labels_csv", "overlay_dir"):
+    for key in ("external_test_dicom_dir", "external_test_labels_csv"):
         p[key] = join(p[key])
     p["output_dir"] = str(Path(p["output_dir"]))
 
@@ -48,3 +47,19 @@ def apply_overrides(section, args, names):
         v = getattr(args, name, None)
         if v is not None and v is not False:
             section[name] = v
+
+
+def run_name(cfg):
+    """Name used for every output file of a run, e.g. cv5_t2_resnet18_mytag."""
+    tc = cfg["training"]
+    tag = f"_{tc['tag']}" if tc.get("tag") else ""
+    return f"cv{tc['folds']}_{tc['channels']}_{tc['backbone']}{tag}"
+
+
+def channel_indices(cfg):
+    """Plane indices for the chosen channel preset (training.channels)."""
+    name = cfg["training"]["channels"]
+    presets = cfg["channels"]
+    if name not in presets:
+        raise ValueError(f"unknown channels '{name}', choose from {list(presets)}")
+    return tuple(presets[name])
