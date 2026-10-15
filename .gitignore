@@ -3,7 +3,10 @@ configs/local.yaml
 data/
 *.pt
 *.npz
+*.npy
 *.dcm
+planes_cache_*/
+.venv/
 __pycache__/
 *.egg-info/
 .ipynb_checkpoints/
