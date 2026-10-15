@@ -1,308 +1,262 @@
-"""5-fold CV classification training (3-channel, image-only).
-Run: python scripts/train.py [--config configs/default.yaml] [--epochs 15] [--batch-size 8] ..."""
+"""5-fold CV classification, NO augmentation, on the 5-plane preprocessing.
+
+Planes in the cache: 0 raw, 1 clean, 2 guide (binary), 3 ext (HU in dilated region), 4 guide_hu (HU in binarised region)
+
+  --channels t2       clean, guide_hu, ext     (default, all HU-valued)
+  --channels t2clean  clean, guide, ext        (binary guide mask in channel 2)
+  --channels t1       clean, clean, clean      (control)
+
+Pool: 500 bleeding + 500 non-bleeding -> every fold: 800 train (400+400) / 200 val (100+100).
+Best fold = highest validation AUC (ties: lower val loss). Only that fold is evaluated on the test set.
+Test = every scan outside the pool.
+
+Run: python scripts/train.py --channels t2 --tag t2
+"""
 import argparse
 import copy
 import os
 import time
-from functools import partial
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-from sklearn.metrics import roc_auc_score
+import torch.nn.functional as F
 from sklearn.model_selection import StratifiedKFold
-from thop import profile as thop_profile
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from stroke_ct.config import apply_overrides, load_config
-from stroke_ct.datasets import Image3ChDataset
+from stroke_ct.config import apply_overrides, channel_indices, load_config, run_name
+from stroke_ct.datasets import PlanesDataset
 from stroke_ct.manifest import build_file_manifest
-from stroke_ct.metrics import binary_metrics, print_confusion
-from stroke_ct.models import Image3ChResNet
-from stroke_ct.preprocessing import Preprocessor
+from stroke_ct.metrics import classification_metrics, safe_auc, show, youden_threshold
+from stroke_ct.models import ResNetClassifier
+from stroke_ct.preprocessing import PLANE_NAMES, Preprocessor
 from stroke_ct.seeding import seed_everything, seeded_generator, worker_init_fn
 
 
 def build_arg_parser():
-    p = argparse.ArgumentParser(description="3-channel image-only classifier, 5-fold CV")
+    p = argparse.ArgumentParser(description="5-fold CV classifier on cached preprocessing planes")
     p.add_argument("--config", type=str, default="configs/default.yaml")
+    p.add_argument("--channels", default=None, help="t1 | t2 | t2clean (see 'channels:' in the config)")
+    p.add_argument("--backbone", default=None, choices=["resnet18", "resnet34", "resnet50"])
     p.add_argument("--n-per-class-pool", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--folds", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--patience", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
-    p.add_argument("--folds", type=int, default=None)
+    p.add_argument("--weight-decay", type=float, default=None)
+    p.add_argument("--exclude-by-filename", action="store_true",
+                   help="build the test set by excluding the pool by filename only (old behaviour)")
+    p.add_argument("--no-pretrained", action="store_true")
     p.add_argument("--num-workers", type=int, default=None)
-    p.add_argument("--recall-weight", type=float, default=None)
-    p.add_argument("--precision-weight", type=float, default=None)
-    p.add_argument("--device", type=str, default=None, help="'cuda' or 'cpu' (default: auto)")
+    p.add_argument("--warm-jobs", type=int, default=None)
+    p.add_argument("--no-warm", action="store_true")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--device", default=None)
+    p.add_argument("--tag", default=None)
     return p
 
 
+def rid(r):
+    return f"{r['class_name']}/{r['filename']}"
+
+
+def make_pool_and_test(manifest, n_per_class, seed, exclude_by_filename=False):
+    pool_all = [r for r in manifest if r["split"] == "train"]
+    bleed = [r for r in pool_all if r["label"] == 1]
+    non = [r for r in pool_all if r["label"] == 0]
+    if len(bleed) < n_per_class or len(non) < n_per_class:
+        raise ValueError(f"need {n_per_class}/class, have bleeding={len(bleed)}, non-bleeding={len(non)}")
+    rng = np.random.default_rng(seed)
+    pick = lambda recs: [recs[i] for i in rng.choice(len(recs), size=n_per_class, replace=False)]
+    pool = pick(bleed) + pick(non)
+    if exclude_by_filename:
+        used = {r["filename"] for r in pool}
+        test = [r for r in pool_all if r["filename"] not in used]
+    else:
+        used = {rid(r) for r in pool}
+        test = [r for r in pool_all if rid(r) not in used]
+    return pool, test
+
+
+@torch.no_grad()
 def predict(model, loader, device):
     model.eval()
-    probs_all, labels_all = [], []
-    with torch.no_grad():
-        for imgs, labels, _ in loader:
-            imgs = imgs.to(device)
-            class_logit, _ = model(imgs, seg=False)
-            probs = torch.sigmoid(class_logit).cpu().numpy().flatten()
-            probs_all.extend(probs.tolist())
-            labels_all.extend(labels.numpy().tolist())
-    return probs_all, labels_all
+    probs, labels, loss_sum, n = [], [], 0.0, 0
+    for x, y in loader:
+        x = x.to(device)
+        logit = model(x)
+        loss_sum += F.binary_cross_entropy_with_logits(
+            logit, y.float().unsqueeze(1).to(device), reduction="sum").item()
+        probs += torch.sigmoid(logit).cpu().numpy().ravel().tolist()
+        labels += y.numpy().tolist()
+        n += len(y)
+    return np.array(probs), np.array(labels), loss_sum / max(n, 1)
+
+
+def train_one_fold(fold, train_r, val_r, cfg, device, idx, prep):
+    tc, seed = cfg["training"], cfg["seed"]
+    seed_everything(seed + fold)
+    pin = device.type == "cuda"
+    train_loader = DataLoader(PlanesDataset(train_r, prep, idx, cfg), batch_size=tc["batch_size"], shuffle=True,
+                              num_workers=tc["num_workers"], pin_memory=pin,
+                              generator=seeded_generator(seed + fold),
+                              worker_init_fn=worker_init_fn if tc["num_workers"] > 0 else None)
+    val_loader = DataLoader(PlanesDataset(val_r, prep, idx, cfg), batch_size=tc["batch_size"], shuffle=False,
+                            num_workers=tc["num_workers"], pin_memory=pin)
+
+    model = ResNetClassifier(tc["backbone"], pretrained=tc["pretrained"]).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
+
+    best_auc, best_loss, best_state, bad, epochs_run = -1.0, 1e9, None, 0, 0
+    t0 = time.perf_counter()
+    for epoch in range(1, tc["epochs"] + 1):
+        epochs_run = epoch
+        model.train()
+        run = 0.0
+        for x, y in tqdm(train_loader, desc=f"fold {fold} epoch {epoch}", leave=False):
+            x, t = x.to(device), y.float().unsqueeze(1).to(device)
+            opt.zero_grad()
+            loss = F.binary_cross_entropy_with_logits(model(x), t)
+            loss.backward()
+            opt.step()
+            run += loss.item() * len(y)
+        vp, vy, vloss = predict(model, val_loader, device)
+        vauc = safe_auc(vy, vp)
+        print(f"  fold {fold} epoch {epoch:2d}  train_loss={run / len(train_r):.4f}  "
+              f"val_loss={vloss:.4f}  val_auc={vauc:.4f}")
+        if vauc > best_auc or (vauc == best_auc and vloss < best_loss):
+            best_auc, best_loss, best_state, bad = vauc, vloss, copy.deepcopy(model.state_dict()), 0
+        else:
+            bad += 1
+            if bad >= tc["patience"]:
+                print(f"  fold {fold} early stop at epoch {epoch} (best val_auc={best_auc:.4f})")
+                break
+    minutes = (time.perf_counter() - t0) / 60
+    print(f"  fold {fold} training time: {minutes:.1f} min")
+    model.load_state_dict(best_state)
+    return model, val_loader, best_state, best_auc, best_loss, epochs_run, minutes
 
 
 def main():
     args = build_arg_parser().parse_args()
     cfg = load_config(args.config)
     tc = cfg["training"]
-    apply_overrides(tc, args, ["n_per_class_pool", "batch_size", "epochs", "patience", "lr", "folds",
-                               "num_workers", "recall_weight", "precision_weight", "device"])
+    apply_overrides(tc, args, ["channels", "backbone", "n_per_class_pool", "folds", "epochs", "patience",
+                               "batch_size", "lr", "weight_decay", "exclude_by_filename", "num_workers",
+                               "warm_jobs", "device", "tag"])
+    if args.no_pretrained:
+        tc["pretrained"] = False
+    if args.no_warm:
+        tc["warm_cache"] = False
+    if args.seed is not None:
+        cfg["seed"] = args.seed
 
     seed = cfg["seed"]
+    device = torch.device(tc["device"]) if tc["device"] else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed_everything(seed)
+    idx = channel_indices(cfg)
+    names = [PLANE_NAMES[i] for i in idx]
+    print(f"device={device}  channels={tc['channels']}={names}  backbone={tc['backbone']}  "
+          f"folds={tc['folds']}  (no augmentation)")
+
     out_dir = cfg["paths"]["output_dir"]
     os.makedirs(out_dir, exist_ok=True)
+    name = run_name(cfg)
+    outs = cfg["outputs"]
 
-    N_PER_CLASS_POOL = tc["n_per_class_pool"]
-    BATCH_SIZE = tc["batch_size"]
-    NUM_EPOCHS = tc["epochs"]
-    EARLY_STOP_PATIENCE = tc["patience"]
-    LEARNING_RATE = tc["lr"]
-    N_FOLDS = tc["folds"]
-    NUM_WORKERS = tc["num_workers"]
-    RECALL_WEIGHT = tc["recall_weight"]
-    PRECISION_WEIGHT = tc["precision_weight"]
-    THRESH = tc["decision_threshold"]
-    DEVICE = torch.device(tc["device"]) if tc["device"] else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {DEVICE}")
-
-    seed_everything(seed)
-    print(f"Seeded everything with seed={seed}")
-
-    file_manifest = build_file_manifest(cfg)
+    manifest = build_file_manifest(cfg)
     prep = Preprocessor(cfg)
     img_size = cfg["data"]["img_size"]
-    w_init = partial(worker_init_fn, seed=seed) if NUM_WORKERS > 0 else None
 
-    # ---------------- balanced pool + fixed held-out remaining test set ----------------
-    train_pool_all = [r for r in file_manifest if r["split"] == "train"]
-    bleed_records = [r for r in train_pool_all if r["label"] == 1]
-    nonbleed_records = [r for r in train_pool_all if r["label"] == 0]
+    pool, test_r = make_pool_and_test(manifest, tc["n_per_class_pool"], seed, tc["exclude_by_filename"])
+    cnt = lambda rs: f"{len(rs)} (bleeding={sum(r['label'] == 1 for r in rs)}, non={sum(r['label'] == 0 for r in rs)})"
+    print(f"CV pool {cnt(pool)} | held-out test {cnt(test_r)}  (test used once, best fold only)")
 
-    if len(bleed_records) < N_PER_CLASS_POOL or len(nonbleed_records) < N_PER_CLASS_POOL:
-        raise ValueError(f"Not enough records for {N_PER_CLASS_POOL}/class pool.")
+    labels = np.array([r["label"] for r in pool])
+    skf = StratifiedKFold(n_splits=tc["folds"], shuffle=True, random_state=seed)
+    splits = list(skf.split(np.zeros(len(pool)), labels))
+    n_tr = 2 * tc["n_per_class_pool"] * (tc["folds"] - 1) // tc["folds"]
+    n_va = 2 * tc["n_per_class_pool"] // tc["folds"]
+    for tr, va in splits:
+        assert len(tr) == n_tr and labels[tr].sum() == n_tr // 2, "unexpected train split"
+        assert len(va) == n_va and labels[va].sum() == n_va // 2, "unexpected val split"
 
-    rng = np.random.default_rng(seed)
-    bleed_idx = rng.choice(len(bleed_records), size=N_PER_CLASS_POOL, replace=False)
-    nonbleed_idx = rng.choice(len(nonbleed_records), size=N_PER_CLASS_POOL, replace=False)
+    rows = [dict(id=rid(r), set="test", fold=-1, label=r["label"]) for r in test_r]
+    for f, (tr, va) in enumerate(splits, start=1):
+        rows += [dict(id=rid(pool[i]), set="train", fold=f, label=pool[i]["label"]) for i in tr]
+        rows += [dict(id=rid(pool[i]), set="val", fold=f, label=pool[i]["label"]) for i in va]
+    pd.DataFrame(rows).to_csv(os.path.join(out_dir, outs["split_csv"].format(name=name)), index=False)
 
-    cv_pool = [bleed_records[i] for i in bleed_idx] + [nonbleed_records[i] for i in nonbleed_idx]
-    pool_filenames = {r["filename"] for r in cv_pool}
-    remaining_test_set = [r for r in train_pool_all if r["filename"] not in pool_filenames]
+    if tc["warm_cache"]:
+        prep.warm_cache(pool + test_r, img_size, n_jobs=tc["warm_jobs"])
 
-    print(f"CV pool: {len(cv_pool)} scans ({N_PER_CLASS_POOL} bleeding + {N_PER_CLASS_POOL} non-bleeding)")
-    print(f"Held-out remaining test set: {len(remaining_test_set)} scans (NOT touched until the very end)")
+    chk = prep.get_planes(pool[0], img_size)[list(idx)]
+    print(f"input check: shape={chk.shape}  per-channel min/max="
+          f"{[(round(float(c.min()), 3), round(float(c.max()), 3)) for c in chk]}")
 
-    pool_labels = np.array([r["label"] for r in cv_pool])
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=seed)
+    # ---------------- train every fold, validation only ----------------
+    fold_rows, fold_paths, fold_val_thr = [], [], []
+    cv_t0 = time.perf_counter()
+    for fold, (tr_pos, va_pos) in enumerate(splits, start=1):
+        print(f"\n{'=' * 70}\nFOLD {fold}/{tc['folds']}\n{'=' * 70}")
+        train_r, val_r = [pool[i] for i in tr_pos], [pool[i] for i in va_pos]
+        print(f"train {cnt(train_r)} | val {cnt(val_r)}")
 
-    fold_results = []
-    cv_total_start = time.perf_counter()
+        model, val_loader, best_state, vauc, vloss, epochs_run, minutes = train_one_fold(
+            fold, train_r, val_r, cfg, device, idx, prep)
+        model_path = os.path.join(out_dir, outs["fold_model"].format(name=name, fold=fold))
+        torch.save(best_state, model_path)
+        fold_paths.append(model_path)
 
-    for fold_idx, (train_pos, val_pos) in enumerate(skf.split(np.zeros(len(cv_pool)), pool_labels), start=1):
-        print(f"\n{'='*60}\nFOLD {fold_idx}/{N_FOLDS} (classification, 3-channel image-only)\n{'='*60}")
+        vp, vy, _ = predict(model, val_loader, device)
+        thr_val = youden_threshold(vy, vp)
+        fold_val_thr.append(thr_val)
+        m05 = classification_metrics(vy, vp, 0.5)
+        mthr = classification_metrics(vy, vp, thr_val)
+        show(f"FOLD {fold} VAL@0.5", m05)
+        show(f"FOLD {fold} VAL@YOUDEN", mthr)
+        fold_rows.append({"fold": fold, "val_auc": vauc, "val_loss": vloss, "val_thr_youden": thr_val,
+                          "epochs_trained": epochs_run, "fold_time_min": minutes, "model_path": model_path,
+                          **{f"val_{k}": v for k, v in m05.items() if k != "thr"}})
 
-        fold_train_records = [cv_pool[i] for i in train_pos]
-        fold_val_records = [cv_pool[i] for i in val_pos]
-        print(f"Fold train: {len(fold_train_records)}, fold val: {len(fold_val_records)}")
+    print(f"\nTOTAL CV TIME: {(time.perf_counter() - cv_t0) / 60:.1f} min")
+    df = pd.DataFrame(fold_rows)
+    df.to_csv(os.path.join(out_dir, outs["folds_csv"].format(name=name)), index=False)
 
-        train_dataset = Image3ChDataset(fold_train_records, cfg, prep, augment=tc["augment"])
-        val_dataset = Image3ChDataset(fold_val_records, cfg, prep, augment=False)
+    print(f"\n{'=' * 70}\nVALIDATION SUMMARY (all folds)\n{'=' * 70}")
+    print(df[["fold", "val_auc", "val_loss", "val_accuracy", "val_precision", "val_recall",
+              "val_specificity", "val_f1", "epochs_trained"]].to_string(index=False))
+    for c in ["val_auc", "val_accuracy", "val_precision", "val_recall", "val_specificity", "val_f1"]:
+        print(f"  {c:16s} mean={df[c].mean():.4f}  std={df[c].std(ddof=0):.4f}")
 
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                                  num_workers=NUM_WORKERS, pin_memory=True,
-                                  generator=seeded_generator(seed + fold_idx),
-                                  worker_init_fn=w_init)
-        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                                num_workers=NUM_WORKERS, pin_memory=True)
+    # ---------------- best fold by validation AUC (ties: lower val loss) ----------------
+    best = df.sort_values(["val_auc", "val_loss"], ascending=[False, True]).iloc[0]
+    bf = int(best["fold"])
+    thr_val = fold_val_thr[bf - 1]
+    print(f"\nBEST FOLD by validation AUC: {bf}  (val_auc={best['val_auc']:.4f}, val_loss={best['val_loss']:.4f})")
+    print(f"  model: {fold_paths[bf - 1]}")
 
-        model = Image3ChResNet().to(DEVICE)
+    # ---------------- test set: evaluated ONCE, best fold only ----------------
+    print(f"\n{'=' * 70}\nTEST SET (best fold {bf} only, evaluated once)\n{'=' * 70}")
+    best_model = ResNetClassifier(tc["backbone"], pretrained=False).to(device)
+    best_model.load_state_dict(torch.load(fold_paths[bf - 1], map_location=device))
+    test_loader = DataLoader(PlanesDataset(test_r, prep, idx, cfg), batch_size=tc["batch_size"], shuffle=False,
+                             num_workers=tc["num_workers"], pin_memory=device.type == "cuda")
+    t0 = time.perf_counter()
+    tp_, ty, _ = predict(best_model, test_loader, device)
+    print(f"test inference: {time.perf_counter() - t0:.1f}s for {len(test_r)} scans")
 
-        if fold_idx == 1:
-            dummy_input = torch.randn(1, 3, img_size, img_size).to(DEVICE)
-            macs, n_params = thop_profile(model, inputs=(dummy_input, False), verbose=False)
-            print(f"  Model complexity (classification-only forward path): "
-                  f"{macs/1e9:.3f} GFLOPs (MACs={macs/1e6:.1f}M), {n_params/1e6:.2f}M parameters")
-            for module in model.modules():
-                if hasattr(module, "total_ops"):
-                    del module.total_ops
-                if hasattr(module, "total_params"):
-                    del module.total_params
-
-        class_criterion = nn.BCEWithLogitsLoss()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=tc["weight_decay"])
-
-        best_val_auc = -1.0
-        best_state = None
-        patience_counter = 0
-        stopped_early_at = None
-
-        fold_start_time = time.perf_counter()
-        for epoch in range(1, NUM_EPOCHS + 1):
-            epoch_start_time = time.perf_counter()
-            model.train()
-            running_loss = 0.0
-            for imgs, labels, _ in tqdm(train_loader, desc=f"Fold {fold_idx} Epoch {epoch}", leave=False):
-                imgs = imgs.to(DEVICE)
-                labels_t = labels.float().unsqueeze(1).to(DEVICE)
-
-                optimizer.zero_grad()
-                class_logit, _ = model(imgs, seg=False)
-                loss = class_criterion(class_logit, labels_t)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item() * imgs.size(0)
-
-            train_loss = running_loss / len(train_dataset)
-
-            val_probs, val_labels_list = predict(model, val_loader, DEVICE)
-            val_auc = roc_auc_score(val_labels_list, val_probs) if len(set(val_labels_list)) > 1 else 0.5
-            epoch_elapsed = time.perf_counter() - epoch_start_time
-            print(f"  Epoch {epoch}: train_loss={train_loss:.4f}, val_auc={val_auc:.4f}")
-            print(f"    (epoch took {epoch_elapsed:.1f}s)")
-
-            if val_auc > best_val_auc:
-                best_val_auc = val_auc
-                best_state = copy.deepcopy(model.state_dict())
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= EARLY_STOP_PATIENCE:
-                    stopped_early_at = epoch
-                    print(f"  Early stopping at epoch {epoch} (best val_auc={best_val_auc:.4f})")
-                    break
-
-        if best_state is None:
-            best_state = copy.deepcopy(model.state_dict())
-        model.load_state_dict(best_state)
-        epochs_trained = stopped_early_at if stopped_early_at is not None else NUM_EPOCHS
-
-        val_probs, val_labels_list = predict(model, val_loader, DEVICE)
-        val_preds = (np.array(val_probs) >= THRESH).astype(int)
-        val_labels_arr = np.array(val_labels_list)
-        vm = binary_metrics(val_labels_arr, val_preds)
-
-        print(f"\nFold {fold_idx} VALIDATION CONFUSION MATRIX (rows=actual, cols=predicted):")
-        print_confusion(vm)
-        print(f"\nFold {fold_idx} VALIDATION METRICS:")
-        print(f"  Accuracy    = {vm['accuracy']:.4f}")
-        print(f"  AUC         = {best_val_auc:.4f}")
-        print(f"  Precision   = {vm['precision']:.4f}")
-        print(f"  Recall      = {vm['recall']:.4f}")
-        print(f"  Specificity = {vm['specificity']:.4f}")
-        print(f"  F1          = {vm['f1']:.4f}")
-        print(f"  ({epochs_trained} epochs, {'early stopped' if stopped_early_at else 'full ceiling'})")
-
-        fold_elapsed = time.perf_counter() - fold_start_time
-        print(f"  Fold {fold_idx} total time: {fold_elapsed/60:.2f} min "
-              f"({epochs_trained} epochs, {fold_elapsed/epochs_trained:.1f}s/epoch avg)")
-
-        model_path = os.path.join(out_dir, cfg["outputs"]["fold_model_pattern"].format(fold=fold_idx))
-        torch.save(model.state_dict(), model_path)
-
-        fold_results.append({
-            "fold": fold_idx,
-            "epochs_trained": epochs_trained,
-            "early_stopped": stopped_early_at is not None,
-            "val_accuracy": vm["accuracy"],
-            "val_auc": best_val_auc,
-            "val_precision": vm["precision"],
-            "val_recall": vm["recall"],
-            "val_specificity": vm["specificity"],
-            "val_f1": vm["f1"],
-            "val_TP": vm["TP"], "val_TN": vm["TN"], "val_FP": vm["FP"], "val_FN": vm["FN"],
-            "model_path": model_path,
-            "fold_time_min": fold_elapsed / 60,
-        })
-
-    cv_total_elapsed = time.perf_counter() - cv_total_start
-    print(f"\n{'='*90}\nTOTAL {N_FOLDS}-FOLD CV WALL-CLOCK TIME: {cv_total_elapsed/60:.2f} min\n{'='*90}")
-
-    results_df = pd.DataFrame(fold_results)
-    print(f"\n{'='*90}\nCLASSIFICATION CV SUMMARY (VALIDATION METRICS ONLY, ALL FOLDS)\n{'='*90}")
-    print(results_df.to_string(index=False))
-
-    results_df["combined_score"] = (
-        RECALL_WEIGHT * results_df["val_recall"] + PRECISION_WEIGHT * results_df["val_precision"]
-    )
-    best_fold_row = results_df.sort_values(
-        by=["combined_score", "val_f1", "val_recall", "val_auc"],
-        ascending=[False, False, False, False]
-    ).iloc[0]
-
-    BEST_FOLD_MODEL_PATH = best_fold_row["model_path"]
-    print(f"\nBest fold (by VALIDATION combined recall+precision score, "
-          f"weights: recall={RECALL_WEIGHT}, precision={PRECISION_WEIGHT}): {int(best_fold_row['fold'])}")
-    print(f"  combined_score={best_fold_row['combined_score']:.4f}  "
-          f"val_recall={best_fold_row['val_recall']:.4f}  val_precision={best_fold_row['val_precision']:.4f}  "
-          f"val_f1={best_fold_row['val_f1']:.4f}  val_auc={best_fold_row['val_auc']:.4f}  "
-          f"val_accuracy={best_fold_row['val_accuracy']:.4f}")
-    print(f"  -> {BEST_FOLD_MODEL_PATH}")
-
-    summary_path = os.path.join(out_dir, cfg["outputs"]["cv_summary_csv"])
-    results_df.to_csv(summary_path, index=False)
-    print(f"\nValidation-only summary saved to: {summary_path}")
-
-    # ---------------- FINAL TEST-SET EVALUATION, ONCE, BEST FOLD ONLY ----------------
-    print(f"\n{'='*90}\nFINAL TEST-SET EVALUATION (single run, best fold only, "
-          f"selected purely from validation)\n{'='*90}")
-
-    test_dataset = Image3ChDataset(remaining_test_set, cfg, prep, augment=False)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                             num_workers=NUM_WORKERS, pin_memory=True)
-
-    test_eval_start = time.perf_counter()
-    best_model = Image3ChResNet().to(DEVICE)
-    best_model.load_state_dict(torch.load(BEST_FOLD_MODEL_PATH, map_location=DEVICE))
-    test_probs, test_labels_list = predict(best_model, test_loader, DEVICE)
-
-    test_preds = (np.array(test_probs) >= THRESH).astype(int)
-    test_labels_arr = np.array(test_labels_list)
-    test_eval_elapsed = time.perf_counter() - test_eval_start
-    print(f"\nTest-set inference took {test_eval_elapsed:.1f}s for {len(remaining_test_set)} scans "
-          f"({test_eval_elapsed/len(remaining_test_set)*1000:.1f} ms/scan avg)")
-
-    tm = binary_metrics(test_labels_arr, test_preds)
-    test_auc = roc_auc_score(test_labels_arr, test_probs) if len(set(test_labels_list)) > 1 else 0.5
-
-    print(f"\nTEST CONFUSION MATRIX (rows=actual, cols=predicted):")
-    print_confusion(tm)
-    print(f"\nFINAL TEST METRICS (best fold = {int(best_fold_row['fold'])}, chosen by validation only):")
-    print(f"  Accuracy    = {tm['accuracy']:.4f}")
-    print(f"  AUC         = {test_auc:.4f}")
-    print(f"  Precision   = {tm['precision']:.4f}")
-    print(f"  Recall      = {tm['recall']:.4f}  (sensitivity -- fraction of actual bleeds caught)")
-    print(f"  Specificity = {tm['specificity']:.4f}  (fraction of actual non-bleeds correctly cleared)")
-    print(f"  F1          = {tm['f1']:.4f}")
-
-    test_summary = {
-        "best_fold": int(best_fold_row["fold"]),
-        "test_accuracy": tm["accuracy"], "test_auc": test_auc,
-        "test_precision": tm["precision"], "test_recall": tm["recall"],
-        "test_specificity": tm["specificity"], "test_f1": tm["f1"],
-        "test_TP": tm["TP"], "test_TN": tm["TN"], "test_FP": tm["FP"], "test_FN": tm["FN"],
-        "test_eval_time_sec": test_eval_elapsed,
-        "cv_total_time_min": cv_total_elapsed / 60,
-    }
-    test_summary_path = os.path.join(out_dir, cfg["outputs"]["final_test_csv"])
-    pd.DataFrame([test_summary]).to_csv(test_summary_path, index=False)
-    print(f"\nFinal test summary saved to: {test_summary_path}")
-
-    probs_path = os.path.join(out_dir, cfg["outputs"]["test_probs_npz"])
-    np.savez(probs_path, test_probs=np.array(test_probs), test_labels=test_labels_arr)
-    print(f"Raw test-set probabilities/labels saved to: {probs_path}")
+    res = {"test@0.5": classification_metrics(ty, tp_, tc["decision_threshold"]),
+           "test@val_youden_thr": classification_metrics(ty, tp_, thr_val)}
+    for k, d in res.items():
+        show(f"BEST FOLD {bf} {k.upper()}", d)
+    pd.DataFrame([{"best_fold": bf, "split": k, **d} for k, d in res.items()]).to_csv(
+        os.path.join(out_dir, outs["test_csv"].format(name=name)), index=False)
+    np.savez(os.path.join(out_dir, outs["test_probs_npz"].format(name=name)),
+             test_probs=tp_, test_labels=ty, best_fold=bf, val_threshold=thr_val)
+    print(f"\n[cache] this process: hits={prep.stats['hit']} misses={prep.stats['miss']}")
 
 
 if __name__ == "__main__":
